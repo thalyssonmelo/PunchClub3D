@@ -1,0 +1,40 @@
+{
+    // Ctrl+Shift+B  -> compila
+    // Terminal > Executar Tarefa... -> "Jogar"
+    // No Windows precisa do MSYS2 instalado em C:\msys64 (veja o README)
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Compilar (Windows / MSYS2)",
+            "type": "process",
+            "command": "C:/msys64/usr/bin/bash.exe",
+            "args": ["-lc", "make"],
+            "options": { "cwd": "${workspaceFolder}", "env": { "MSYSTEM": "MINGW64", "CHERE_INVOKING": "1" } },
+            "group": { "kind": "build", "isDefault": true },
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "Jogar (Windows / MSYS2)",
+            "type": "process",
+            "command": "C:/msys64/usr/bin/bash.exe",
+            "args": ["-lc", "make && ./punchclub3d.exe"],
+            "options": { "cwd": "${workspaceFolder}", "env": { "MSYSTEM": "MINGW64", "CHERE_INVOKING": "1" } },
+            "group": "test",
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "Compilar (Linux / macOS)",
+            "type": "shell",
+            "command": "make",
+            "group": "build",
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "Jogar (Linux / macOS)",
+            "type": "shell",
+            "command": "make && ./punchclub3d",
+            "group": "test",
+            "problemMatcher": ["$gcc"]
+        }
+    ]
+}
