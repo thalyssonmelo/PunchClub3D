@@ -17,5 +17,6 @@ namespace Textures {
     GLuint get(TexId id);
     void bind(TexId id);      // habilita GL_TEXTURE_2D e associa (respeita a chave de texturas)
     void unbind();
+    void setNearest(bool on); // modo PS1: filtragem GL_NEAREST
     extern bool enabled;      // F5 liga/desliga texturas
 }

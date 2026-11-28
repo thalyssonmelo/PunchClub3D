@@ -1072,6 +1072,7 @@ void Game::specialDown(int k) {
     case GLUT_KEY_F6: lighting = !lighting; break;
     case GLUT_KEY_F7: wire = !wire; break;
     case GLUT_KEY_F8: cones = !cones; break;
+    case GLUT_KEY_F9: ps1 = !ps1; break;
     // Setas navegam nos menus
     case GLUT_KEY_UP:    if (state == GS_MENU || state == GS_HUB) { keyDown('w'); keyUp('w'); } break;
     case GLUT_KEY_DOWN:  if (state == GS_MENU || state == GS_HUB) { keyDown('s'); keyUp('s'); } break;

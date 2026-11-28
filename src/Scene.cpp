@@ -28,6 +28,8 @@ static bool gShadow = false;          // desenhando a sombra (sem materiais)
 static GLdouble MV[16], PJ[16];
 static GLint VP[4];
 static float gTime = 0;
+static bool gPs1 = false;             // modo PS1: cena em baixa resolucao, flat, sem especular
+static float gScaleX = 1, gScaleY = 1; // viewport 3D -> pixels da janela
 
 void init() {
     Q = gluNewQuadric();
@@ -38,7 +40,7 @@ void init() {
 bool project(const Vec3& p, float& sx, float& sy) {
     GLdouble x, y, z;
     if (gluProject(p.x, p.y, p.z, MV, PJ, VP, &x, &y, &z) != GL_TRUE) return false;
-    sx = (float)x; sy = (float)y;
+    sx = (float)x * gScaleX; sy = (float)y * gScaleY;
     return z > 0 && z < 1;
 }
 
@@ -47,6 +49,7 @@ bool project(const Vec3& p, float& sx, float& sy) {
 // ---------------------------------------------------------------------------
 static void mat(float r, float g, float b, float spec = 0.15f, float shin = 16, float er = 0, float eg = 0, float eb = 0) {
     if (gShadow) return;
+    if (gPs1) spec = 0;                  // o PS1 nao tinha brilho especular
     GLfloat a[4] = { r * 0.55f, g * 0.55f, b * 0.55f, 1 }, d[4] = { r, g, b, 1 };
     GLfloat s[4] = { spec, spec, spec, 1 }, e[4] = { er, eg, eb, 1 };
     glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, a);
@@ -149,6 +152,128 @@ static Vec3 solveElbow(const Vec3& S, const Vec3& T, float a, float b, const Vec
 }
 
 // ---------------------------------------------------------------------------
+// MALHAS LOW-POLY (modelagem facetada feita a mao)
+// Cada triangulo recebe a normal da PROPRIA face, entao o modelo fica
+// facetado mesmo com Gouraud. A normal e orientada para fora comparando com
+// o centro da peca (gC), assim a ordem dos vertices nao importa.
+// ---------------------------------------------------------------------------
+static Vec3 gC;
+
+static void tri(Vec3 a, Vec3 b, Vec3 c) {
+    Vec3 n = cross(b - a, c - a);
+    float L = length(n);
+    if (L < 1e-9f) return;
+    n = n / L;
+    if (dot(n, (a + b + c) / 3.0f - gC) < 0) { n = -n; std::swap(b, c); }
+    glNormal3f(n.x, n.y, n.z);
+    glVertex3f(a.x, a.y, a.z); glVertex3f(b.x, b.y, b.z); glVertex3f(c.x, c.y, c.z);
+}
+static void quad4(const Vec3& a, const Vec3& b, const Vec3& c, const Vec3& d, bool flip) {
+    if (flip) { tri(a, b, d); tri(b, c, d); } else { tri(a, b, c); tri(a, c, d); }
+}
+// Ruido deterministico: os vertices "tortos" nao tremem de um quadro para o outro
+static float h3(int a, int b, int c) {
+    unsigned u = (unsigned)a * 73856093u ^ (unsigned)b * 19349663u ^ (unsigned)c * 83492791u;
+    u = (u ^ (u >> 13)) * 1274126177u;
+    return ((u ^ (u >> 16)) & 1023) / 1023.0f;
+}
+
+// Anel de 8 vertices simetrico: frente, frente-dir, dir, tras-dir, tras (+ espelhos)
+struct Ring { Vec3 v[8]; };
+static Ring ring(const Vec3& fc, const Vec3& fr, const Vec3& r, const Vec3& br, const Vec3& bc) {
+    Ring o;
+    o.v[0] = fc; o.v[1] = fr; o.v[2] = r; o.v[3] = br; o.v[4] = bc;
+    o.v[5] = Vec3(-br.x, br.y, br.z); o.v[6] = Vec3(-r.x, r.y, r.z); o.v[7] = Vec3(-fr.x, fr.y, fr.z);
+    return o;
+}
+static Ring scaled(const Ring& in, float sx, float sy, float sz) {
+    Ring o;
+    for (int i = 0; i < 8; ++i) o.v[i] = Vec3(in.v[i].x * sx, in.v[i].y * sy, in.v[i].z * sz);
+    return o;
+}
+// Liga aneis consecutivos (e fecha com um vertice no topo/fundo, se houver)
+static void loft(const Ring* rings, int n, const Vec3* top, const Vec3* bottom, const Vec3& center) {
+    gC = center;
+    glBegin(GL_TRIANGLES);
+    for (int r = 0; r + 1 < n; ++r)
+        for (int i = 0; i < 8; ++i) {
+            int j = (i + 1) % 8;
+            quad4(rings[r].v[i], rings[r].v[j], rings[r + 1].v[j], rings[r + 1].v[i], ((i + r) & 1) != 0);
+        }
+    if (top) for (int i = 0; i < 8; ++i) tri(*top, rings[0].v[i], rings[0].v[(i + 1) % 8]);
+    if (bottom) for (int i = 0; i < 8; ++i) tri(*bottom, rings[n - 1].v[(i + 1) % 8], rings[n - 1].v[i]);
+    glEnd();
+}
+// Faixa aberta usando so os indices pedidos (ex.: so a frente do rosto, para a barba)
+static void loftPart(const Ring* rings, int n, const int* idx, int m, const Vec3* bottom, const Vec3& center) {
+    gC = center;
+    glBegin(GL_TRIANGLES);
+    for (int r = 0; r + 1 < n; ++r)
+        for (int k = 0; k + 1 < m; ++k)
+            quad4(rings[r].v[idx[k]], rings[r].v[idx[k + 1]], rings[r + 1].v[idx[k + 1]], rings[r + 1].v[idx[k]], ((k + r) & 1) != 0);
+    if (bottom) for (int k = 0; k + 1 < m; ++k) tri(*bottom, rings[n - 1].v[idx[k + 1]], rings[n - 1].v[idx[k]]);
+    glEnd();
+}
+
+// Elipsoide facetado com aneis alternados (faces triangulares) e leve
+// irregularidade nos vertices, como um modelo low-poly feito a mao
+static void blob(float rx, float ry, float rz, int sl, int st, int seed, float jitter = 0.07f) {
+    std::vector<Vec3> v((st - 1) * sl);
+    for (int k = 1; k < st; ++k)
+        for (int i = 0; i < sl; ++i) {
+            float ph = PI * k / st, th = 2 * PI * (i + 0.5f * (k & 1)) / sl;
+            float j = 1.0f + jitter * (h3(seed, k, i) * 2 - 1);
+            v[(k - 1) * sl + i] = Vec3(std::sin(ph) * std::cos(th) * rx * j, std::cos(ph) * ry * j, std::sin(ph) * std::sin(th) * rz * j);
+        }
+    Vec3 top(0, ry, 0), bot(0, -ry, 0);
+    gC = Vec3();
+    glBegin(GL_TRIANGLES);
+    for (int i = 0; i < sl; ++i) {
+        int j = (i + 1) % sl;
+        tri(top, v[i], v[j]);
+        tri(bot, v[(st - 2) * sl + j], v[(st - 2) * sl + i]);
+    }
+    for (int k = 0; k + 1 < st - 1; ++k)
+        for (int i = 0; i < sl; ++i) {
+            int j = (i + 1) % sl;
+            const Vec3 &a = v[k * sl + i], &b = v[k * sl + j], &c = v[(k + 1) * sl + i], &d = v[(k + 1) * sl + j];
+            if (k & 1) { tri(a, b, d); tri(a, d, c); } else { tri(a, b, c); tri(b, d, c); }
+        }
+    glEnd();
+}
+static void blobAt(const Vec3& p, float r, int sl, int st, int seed) {
+    glPushMatrix(); translate(p); blob(r, r, r, sl, st, seed); glPopMatrix();
+}
+
+// Membro como prisma de poucos lados ligando dois pontos (com tampas)
+static void prism(const Vec3& A, const Vec3& B, float rA, float rB, int sides, const Vec3& refUp) {
+    Vec3 d = B - A;
+    float L = length(d);
+    if (L < 1e-4f) return;
+    Vec3 z = d / L;
+    Vec3 x = cross(refUp, z);
+    if (length(x) < 1e-3f) x = cross(Vec3(1, 0, 0), z);
+    x = normalize(x);
+    Vec3 y = cross(z, x);
+    Vec3 pa[8], pb[8];
+    for (int i = 0; i < sides; ++i) {
+        float a = 2 * PI * i / sides + 0.4f;
+        Vec3 dir = x * std::cos(a) + y * std::sin(a);
+        pa[i] = A + dir * rA;
+        pb[i] = B + dir * rB;
+    }
+    gC = (A + B) * 0.5f;
+    glBegin(GL_TRIANGLES);
+    for (int i = 0; i < sides; ++i) {
+        int j = (i + 1) % sides;
+        quad4(pa[i], pa[j], pb[j], pb[i], (i & 1) != 0);
+        tri(A, pa[j], pa[i]);
+        tri(B, pb[i], pb[j]);
+    }
+    glEnd();
+}
+
+// ---------------------------------------------------------------------------
 // LUVAS e MANOPLAS
 // ---------------------------------------------------------------------------
 static void glove(const Vec3& pos, const Vec3& dir, const Vec3& upHint, float side, const float* col,
@@ -159,13 +284,14 @@ static void glove(const Vec3& pos, const Vec3& dir, const Vec3& upHint, float si
     Vec3 U = cross(R, F);
     glPushMatrix();
     multFrame(pos, R, U, F);
-    tex(TEX_LEATHER);
-    mat(col[0], col[1], col[2], 0.6f, 40, er, eg, eb);
-    glPushMatrix(); glScalef(0.095f, 0.088f, 0.115f); sphere(1, 20, 14); glPopMatrix();
-    glPushMatrix(); glTranslatef(side * 0.072f, 0.025f, -0.01f); glScalef(0.035f, 0.04f, 0.06f); sphere(1, 10, 8); glPopMatrix();
-    notex();
-    mat(0.92f, 0.92f, 0.92f, 0.1f, 8);   // fita/punho branco
-    glPushMatrix(); glTranslatef(0, 0, -0.17f); gluCylinder(Q, 0.06f, 0.07f, 0.08f, 14, 1); glPopMatrix();
+    mat(col[0], col[1], col[2], 0.25f, 20, er, eg, eb);
+    blob(0.098f, 0.09f, 0.118f, 7, 5, side < 0 ? 11 : 12);                       // corpo da luva
+    glPushMatrix(); glTranslatef(side * 0.074f, 0.022f, -0.012f);                  // polegar
+    blob(0.036f, 0.042f, 0.062f, 5, 3, side < 0 ? 13 : 14); glPopMatrix();
+    mat(0.92f, 0.9f, 0.86f, 0.05f, 6);                                             // punho branco
+    prism(Vec3(0, 0, -0.1f), Vec3(0, 0, -0.21f), 0.07f, 0.064f, 6, Vec3(0, 1, 0));
+    mat(col[0] * 0.55f, col[1] * 0.55f, col[2] * 0.55f, 0.05f, 6);                 // costura
+    prism(Vec3(0, 0, -0.095f), Vec3(0, 0, -0.105f), 0.074f, 0.074f, 6, Vec3(0, 1, 0));
     glPopMatrix();
 }
 
@@ -178,12 +304,147 @@ static void mittPad(const Vec3& pos, const Vec3& facing, bool lit) {
     float pulse = 0.5f + 0.5f * std::sin(gTime * 14);
     if (lit) mat(1.0f, 0.85f, 0.1f, 0.4f, 30, 0.6f + 0.3f * pulse, 0.45f + 0.2f * pulse, 0.0f);
     else mat(0.75f, 0.1f, 0.1f, 0.3f, 20);
-    tex(TEX_LEATHER);
-    glPushMatrix(); glScalef(0.13f, 0.13f, 0.045f); sphere(1, 18, 10); glPopMatrix();
-    notex();
+    blob(0.13f, 0.13f, 0.045f, 8, 4, 21, 0.04f);
     mat(0.95f, 0.95f, 0.95f, 0.1f, 10, lit ? 0.4f : 0, lit ? 0.4f : 0, lit ? 0.4f : 0);
-    glPushMatrix(); glTranslatef(0, 0, 0.035f); gluDisk(Q, 0.06f, 0.08f, 20, 1); glPopMatrix();
+    prism(Vec3(0, 0, 0.03f), Vec3(0, 0, 0.05f), 0.07f, 0.06f, 8, Vec3(0, 1, 0));
     glPopMatrix();
+}
+
+// ---------------------------------------------------------------------------
+// CABECA low-poly (referencial local: x direita, y cima, z frente/rosto)
+// ---------------------------------------------------------------------------
+static const Ring& headRing(int i) {
+    static const Ring R[5] = {
+        ring(Vec3(0, 0.125f, 0.085f),  Vec3(0.070f, 0.125f, 0.070f),  Vec3(0.100f, 0.120f, -0.005f), Vec3(0.072f, 0.120f, -0.085f), Vec3(0, 0.120f, -0.105f)),  // topo
+        ring(Vec3(0, 0.050f, 0.135f),  Vec3(0.078f, 0.055f, 0.118f),  Vec3(0.125f, 0.035f, 0.000f),  Vec3(0.092f, 0.035f, -0.110f), Vec3(0, 0.035f, -0.135f)),  // sobrancelha
+        ring(Vec3(0, -0.025f, 0.140f), Vec3(0.085f, -0.030f, 0.112f), Vec3(0.118f, -0.030f, -0.005f), Vec3(0.082f, -0.035f, -0.098f), Vec3(0, -0.040f, -0.118f)), // macas do rosto
+        ring(Vec3(0, -0.095f, 0.130f), Vec3(0.068f, -0.100f, 0.095f), Vec3(0.095f, -0.085f, -0.010f), Vec3(0.055f, -0.075f, -0.072f), Vec3(0, -0.070f, -0.085f)), // mandibula
+        ring(Vec3(0, -0.152f, 0.105f), Vec3(0.042f, -0.148f, 0.080f), Vec3(0.058f, -0.130f, 0.020f),  Vec3(0.035f, -0.110f, -0.035f), Vec3(0, -0.105f, -0.045f)), // queixo
+    };
+    return R[i];
+}
+
+// Remendo plano sobre o rosto (olhos, boca, hematomas), afastado da pele
+static void decal(const Vec3& a, const Vec3& b, const Vec3& c, const Vec3& d, float lift) {
+    Vec3 n = normalize(cross(b - a, d - a));
+    if (n.z < 0) n = -n;
+    Vec3 o = n * lift;
+    gC = (a + b + c + d) * 0.25f - n;
+    glBegin(GL_TRIANGLES); quad4(a + o, b + o, c + o, d + o, false); glEnd();
+}
+
+static void drawHead(const Appearance& L, const float* sk, float dmg, float flash) {
+    Ring R[5];
+    for (int i = 0; i < 5; ++i) R[i] = headRing(i);
+    const Vec3 top(0, 0.158f, -0.01f), bottom(0, -0.14f, 0.02f), C(0, 0, 0);
+
+    mat(sk[0], sk[1], sk[2], 0.08f, 8);
+    loft(R, 5, &top, &bottom, C);
+    // nariz em cunha
+    {
+        Vec3 t(0, 0.03f, 0.142f), tip(0, -0.035f, 0.178f), l(-0.024f, -0.045f, 0.147f), r(0.024f, -0.045f, 0.147f), b(0, -0.05f, 0.15f);
+        mat(sk[0] * 0.95f, sk[1] * 0.92f, sk[2] * 0.92f, 0.08f, 8);
+        gC = Vec3(0, -0.02f, 0.12f);
+        glBegin(GL_TRIANGLES); tri(t, r, tip); tri(t, tip, l); tri(tip, r, b); tri(tip, b, l); glEnd();
+    }
+    // orelhas
+    mat(sk[0] * 0.9f, sk[1] * 0.85f, sk[2] * 0.85f, 0.05f, 6);
+    for (int s = -1; s <= 1; s += 2) {
+        Vec3 a(s * 0.116f, 0.025f, 0.0f), b(s * 0.116f, -0.045f, -0.004f), c(s * 0.138f, -0.01f, -0.022f), d(s * 0.12f, 0.02f, -0.034f);
+        gC = Vec3(0, -0.01f, -0.01f);
+        glBegin(GL_TRIANGLES); tri(a, b, c); tri(a, c, d); tri(b, d, c); glEnd();
+    }
+
+    // olhos (o esquerdo incha com muito dano) e sobrancelhas
+    for (int s = -1; s <= 1; s += 2) {
+        bool swollen = (s == -1 && dmg > 0.6f);
+        float x0 = s * 0.026f, x1 = s * 0.066f;
+        if (swollen) {
+            mat(0.5f, 0.2f, 0.38f, 0.1f, 10);
+            glPushMatrix(); glTranslatef(s * 0.046f, 0.02f, 0.124f); blob(0.03f, 0.024f, 0.022f, 6, 4, 31); glPopMatrix();
+        } else {
+            mat(0.95f, 0.94f, 0.9f, 0.05f, 8);
+            decal(Vec3(x0, 0.031f, 0.134f), Vec3(x1, 0.031f, 0.124f), Vec3(x1, 0.008f, 0.123f), Vec3(x0, 0.008f, 0.134f), 0.004f);
+            mat(0.06f, 0.05f, 0.05f, 0.05f, 8);
+            float p0 = s * 0.034f, p1 = s * 0.05f;
+            decal(Vec3(p0, 0.028f, 0.133f), Vec3(p1, 0.028f, 0.129f), Vec3(p1, 0.01f, 0.128f), Vec3(p0, 0.01f, 0.132f), 0.007f);
+        }
+        mat(L.hair[0] * 0.55f, L.hair[1] * 0.55f, L.hair[2] * 0.55f, 0.02f, 4);
+        decal(Vec3(s * 0.022f, 0.05f, 0.138f), Vec3(s * 0.072f, 0.046f, 0.124f), Vec3(s * 0.072f, 0.036f, 0.124f), Vec3(s * 0.022f, 0.038f, 0.138f), 0.006f);
+    }
+
+    // ---- Marcas de machucado (aparecem conforme a vida cai) ----
+    if (dmg > 0.3f) {   // hematoma na bochecha direita
+        float k = clampf((dmg - 0.3f) / 0.3f, 0, 1);
+        mat(lerpf(sk[0], 0.55f, k), lerpf(sk[1], 0.22f, k), lerpf(sk[2], 0.32f, k), 0.05f, 6);
+        decal(Vec3(0.045f, -0.008f, 0.132f), Vec3(0.088f, -0.018f, 0.114f), Vec3(0.085f, -0.058f, 0.11f), Vec3(0.048f, -0.052f, 0.128f), 0.004f);
+    }
+    if (dmg > 0.45f) {  // corte acima da sobrancelha esquerda
+        mat(0.75f, 0.05f, 0.05f, 0.2f, 20);
+        decal(Vec3(-0.062f, 0.066f, 0.128f), Vec3(-0.028f, 0.074f, 0.137f), Vec3(-0.03f, 0.064f, 0.138f), Vec3(-0.058f, 0.058f, 0.13f), 0.007f);
+    }
+    if (dmg > 0.75f) {  // nariz sangrando e mandibula roxa
+        mat(0.7f, 0.04f, 0.04f, 0.3f, 20);
+        decal(Vec3(0.004f, -0.052f, 0.152f), Vec3(0.016f, -0.052f, 0.15f), Vec3(0.018f, -0.086f, 0.138f), Vec3(0.008f, -0.086f, 0.14f), 0.006f);
+        mat(0.45f, 0.2f, 0.35f, 0.05f, 6);
+        decal(Vec3(-0.03f, -0.11f, 0.12f), Vec3(-0.07f, -0.1f, 0.09f), Vec3(-0.05f, -0.14f, 0.075f), Vec3(-0.02f, -0.145f, 0.1f), 0.005f);
+    }
+    (void)flash;
+
+    // barba (so a frente da parte de baixo do rosto) e bigode
+    if (L.beard) {
+        mat(L.hair[0], L.hair[1], L.hair[2], 0.02f, 4);
+        Ring B[3] = { scaled(R[2], 1.05f, 1.0f, 1.05f), scaled(R[3], 1.08f, 1.0f, 1.08f), scaled(R[4], 1.1f, 1.05f, 1.1f) };
+        B[0].v[0] = R[2].v[0] * 1.0f + Vec3(0, -0.035f, 0.005f);   // deixa o nariz aparecer
+        static const int idx[5] = { 6, 7, 0, 1, 2 };
+        Vec3 bb(0, -0.165f, 0.06f);
+        loftPart(B, 3, idx, 5, &bb, Vec3(0, -0.06f, 0));
+    }
+    // protetor bucal
+    mat(0.5f, 0.08f, 0.1f, 0.1f, 10);
+    float mz = L.beard ? 0.012f : 0.0f;
+    decal(Vec3(-0.032f, -0.088f, 0.134f + mz), Vec3(0.032f, -0.088f, 0.134f + mz), Vec3(0.028f, -0.104f, 0.128f + mz), Vec3(-0.028f, -0.104f, 0.128f + mz), 0.005f);
+
+    // cabelo
+    mat(L.hair[0], L.hair[1], L.hair[2], 0.05f, 8);
+    auto cap = [&](float s, float hairline) {
+        Ring H[2] = { scaled(R[0], s, 1.04f, s), scaled(R[1], s, 1.0f, s) };
+        for (int i : { 7, 0, 1 }) H[1].v[i] = lerp(H[0].v[i], H[1].v[i], hairline);
+        Vec3 t = top * 1.05f;
+        loft(H, 2, &t, nullptr, Vec3(0, 0.06f, -0.01f));
+    };
+    switch (L.hairStyle) {
+    case 1: cap(1.06f, 0.35f); break;
+    case 2: {   // espetado
+        cap(1.05f, 0.3f);
+        static const float sp[7][4] = {   // x, z, altura, inclinacao para tras
+            { 0.0f, 0.09f, 0.075f, 0.02f }, { 0.0f, 0.03f, 0.09f, 0.04f }, { 0.0f, -0.04f, 0.08f, 0.06f }, { 0.0f, -0.1f, 0.06f, 0.07f },
+            { 0.055f, 0.05f, 0.055f, 0.03f }, { -0.055f, 0.05f, 0.055f, 0.03f }, { 0.06f, -0.04f, 0.05f, 0.05f } };
+        for (int i = 0; i < 7; ++i) {
+            float x = sp[i][0], z = sp[i][1];
+            float y = 0.15f - (x * x) * 6 - std::max(0.0f, -z - 0.05f) * 0.4f;
+            Vec3 a(x - 0.03f, y - 0.02f, z + 0.025f), b(x + 0.03f, y - 0.02f, z + 0.025f), c(x, y - 0.02f, z - 0.035f);
+            Vec3 tip(x * 1.3f, y + sp[i][2], z - sp[i][3]);
+            gC = Vec3(x, y - 0.03f, z);
+            glBegin(GL_TRIANGLES); tri(a, b, tip); tri(b, c, tip); tri(c, a, tip); glEnd();
+            if (i == 6) {  // espelho da ultima ponta lateral
+                Vec3 a2(-a.x, a.y, a.z), b2(-b.x, b.y, b.z), c2(-c.x, c.y, c.z), t2(-tip.x, tip.y, tip.z);
+                gC = Vec3(-x, y - 0.03f, z);
+                glBegin(GL_TRIANGLES); tri(a2, b2, t2); tri(b2, c2, t2); tri(c2, a2, t2); glEnd();
+            }
+        }
+        break; }
+    case 3:     // rabo de cavalo
+        cap(1.06f, 0.3f);
+        prism(Vec3(0, 0.07f, -0.12f), Vec3(0, -0.02f, -0.19f), 0.035f, 0.032f, 5, Vec3(0, 1, 0));
+        prism(Vec3(0, -0.02f, -0.19f), Vec3(0, -0.16f, -0.18f), 0.032f, 0.012f, 5, Vec3(0, 1, 0));
+        break;
+    case 4:     // bone
+        cap(1.09f, 0.0f);
+        glPushMatrix(); glTranslatef(0, 0.06f, 0.155f); glRotatef(-8, 1, 0, 0); box(0.17f, 0.014f, 0.1f); glPopMatrix();
+        break;
+    default: break;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +462,12 @@ static void telegraphColor(PunchType t, float& r, float& g, float& b) {
     }
 }
 
+// Anel octogonal simetrico (tronco e calcao)
+static Ring oval(float y, float rx, float rzF, float rzB, float frontBulge = 0) {
+    return ring(Vec3(0, y, rzF + frontBulge), Vec3(rx * 0.68f, y, rzF * 0.8f), Vec3(rx, y, 0),
+                Vec3(rx * 0.72f, y, -rzB * 0.78f), Vec3(0, y, -rzB));
+}
+
 static void drawFighter(const Fighter& f, const Appearance& L, DrawMode mode, int litMitt = -1) {
     Vec3 R = f.right(), F = f.fwd(), U(0, 1, 0);
     float bulk = f.bulk;
@@ -211,6 +478,9 @@ static void drawFighter(const Fighter& f, const Appearance& L, DrawMode mode, in
                     lerpf(L.skin[1], 0.35f, dmg * 0.35f),
                     lerpf(L.skin[2], 0.4f, dmg * 0.25f) };
     for (float& c : sk) c = clampf(c, 0, 1);
+    // As malhas tem normais orientadas para fora: dispensa o back-face culling
+    GLboolean cull = glIsEnabled(GL_CULL_FACE);
+    glDisable(GL_CULL_FACE);
 
     Vec3 head = f.headPos();
     Vec3 hips = f.local(f.lean * 0.05f, 0.95f - f.duck * 0.15f, 0);
@@ -226,100 +496,70 @@ static void drawFighter(const Fighter& f, const Appearance& L, DrawMode mode, in
             float sd = s == 0 ? -1.0f : 1.0f;
             Vec3 hip = hips + bodyR * (sd * 0.1f * bulk);
             Vec3 foot = s == 0 ? footL : footR;
-            Vec3 knee = solveElbow(hip, foot + Vec3(0, 0.08f, 0), 0.47f, 0.47f, hip + F * 1.0f + Vec3(0, -0.3f, 0));
-            mat(sk[0], sk[1], sk[2], 0.2f, 12);
-            limb(hip, knee, 0.078f * bulk, 0.06f * bulk);
-            glPushMatrix(); translate(knee); sphere(0.06f * bulk, 10, 8); glPopMatrix();
-            limb(knee, foot + Vec3(0, 0.08f, 0), 0.06f * bulk, 0.045f);
+            Vec3 ankle = foot + Vec3(0, 0.08f, 0);
+            Vec3 knee = solveElbow(hip, ankle, 0.47f, 0.47f, hip + F * 1.0f + Vec3(0, -0.3f, 0));
+            mat(sk[0], sk[1], sk[2], 0.08f, 8);
+            prism(hip, knee, 0.08f * bulk, 0.058f * bulk, 5, F);
+            blobAt(knee, 0.058f * bulk, 5, 3, 40 + s);
+            prism(knee, ankle, 0.06f * bulk, 0.04f, 5, F);
             // tenis
-            mat(0.1f, 0.1f, 0.12f, 0.3f, 20);
+            mat(0.12f, 0.12f, 0.15f, 0.1f, 10);
             glPushMatrix(); translate(foot + Vec3(0, 0.045f, 0) + F * 0.04f);
             multFrame(Vec3(), R, U, F); box(0.11f, 0.09f, 0.26f);
             glPopMatrix();
+            mat(0.9f, 0.9f, 0.9f, 0.05f, 6);   // meia
+            prism(ankle - Vec3(0, 0.02f, 0), ankle + Vec3(0, 0.04f, 0), 0.046f, 0.044f, 5, F);
             // perna do calcao
-            mat(L.shorts[0], L.shorts[1], L.shorts[2], 0.35f, 30);
-            limb(hip, lerp(hip, knee, 0.45f), 0.1f * bulk, 0.095f * bulk);
+            mat(L.shorts[0], L.shorts[1], L.shorts[2], 0.1f, 10);
+            prism(hip + spineUp * 0.04f, lerp(hip, knee, 0.42f), 0.105f * bulk, 0.096f * bulk, 6, F);
         }
-        // ---- Calcao e tronco ----
+        // ---- Calcao e tronco (referencial do corpo) ----
         glPushMatrix();
         multFrame(hips + spineUp * 0.03f, bodyR, spineUp, bodyF);
-        mat(L.shorts[0], L.shorts[1], L.shorts[2], 0.35f, 30);
-        glPushMatrix(); glScalef(0.21f * bulk, 0.16f, 0.15f * bulk); sphere(1); glPopMatrix();
-        mat(0.95f, 0.95f, 0.95f, 0.2f, 10);   // elastico
-        glPushMatrix(); glTranslatef(0, 0.1f, 0); glRotatef(-90, 1, 0, 0); gluCylinder(Q, 0.19f * bulk, 0.185f * bulk, 0.05f, 20, 1); glPopMatrix();
-        mat(sk[0], sk[1], sk[2], 0.12f, 14);
-        glPushMatrix(); glTranslatef(0, 0.2f, 0.0f); glScalef(0.18f * bulk, 0.15f, 0.12f * bulk); sphere(1); glPopMatrix();    // abdomen
-        glPushMatrix(); glTranslatef(0, 0.36f, 0.0f); glScalef(0.23f * bulk, 0.2f, 0.14f * bulk); sphere(1); glPopMatrix();    // peito
-        for (int s = -1; s <= 1; s += 2) {   // peitorais
-            glPushMatrix(); glTranslatef(s * 0.085f * bulk, 0.38f, 0.07f * bulk); glScalef(0.09f, 0.07f, 0.06f); sphere(1, 12, 8); glPopMatrix();
+        const float b = bulk;
+        {
+            Ring S[4] = { oval(0.13f, 0.185f * b, 0.135f * b, 0.13f * b), oval(0.08f, 0.192f * b, 0.14f * b, 0.135f * b),
+                          oval(-0.06f, 0.215f * b, 0.155f * b, 0.16f * b), oval(-0.17f, 0.2f * b, 0.14f * b, 0.15f * b) };
+            Vec3 bot(0, -0.19f, 0);
+            mat(0.94f, 0.93f, 0.9f, 0.05f, 6);   // elastico
+            loft(S, 2, nullptr, nullptr, Vec3(0, 0.1f, 0));
+            mat(L.shorts[0], L.shorts[1], L.shorts[2], 0.1f, 10);
+            loft(S + 1, 3, nullptr, &bot, Vec3(0, -0.05f, 0));
+            // faixa lateral do calcao
+            mat(std::min(1.0f, L.shorts[0] * 0.5f + 0.45f), std::min(1.0f, L.shorts[1] * 0.5f + 0.45f), std::min(1.0f, L.shorts[2] * 0.5f + 0.45f), 0.05f, 6);
+            for (int s = -1; s <= 1; s += 2)
+                decal(Vec3(s * 0.2f * b, 0.07f, 0.03f), Vec3(s * 0.2f * b, 0.07f, -0.03f), Vec3(s * 0.212f * b, -0.12f, -0.03f), Vec3(s * 0.212f * b, -0.12f, 0.03f), 0.006f);
+        }
+        {
+            Ring T[5] = {
+                ring(Vec3(0, 0.06f, 0.11f * b),  Vec3(0.12f * b, 0.06f, 0.09f * b),  Vec3(0.165f * b, 0.06f, 0),     Vec3(0.12f * b, 0.06f, -0.09f * b),  Vec3(0, 0.06f, -0.1f * b)),   // cintura
+                ring(Vec3(0, 0.20f, 0.128f * b), Vec3(0.12f * b, 0.2f, 0.1f * b),    Vec3(0.175f * b, 0.21f, 0),     Vec3(0.13f * b, 0.2f, -0.1f * b),    Vec3(0, 0.2f, -0.11f * b)),   // abdomen
+                ring(Vec3(0, 0.31f, 0.13f * b),  Vec3(0.1f * b, 0.32f, 0.152f * b),  Vec3(0.2f * b, 0.34f, 0.01f),   Vec3(0.15f * b, 0.34f, -0.11f * b),  Vec3(0, 0.34f, -0.12f * b)),  // base do peitoral
+                ring(Vec3(0, 0.44f, 0.12f * b),  Vec3(0.13f * b, 0.45f, 0.12f * b),  Vec3(0.235f * b, 0.45f, 0),     Vec3(0.16f * b, 0.46f, -0.1f * b),   Vec3(0, 0.46f, -0.11f * b)),  // peito
+                ring(Vec3(0, 0.52f, 0.05f),      Vec3(0.06f * b, 0.53f, 0.05f),      Vec3(0.1f * b, 0.54f, 0),       Vec3(0.07f * b, 0.53f, -0.06f),      Vec3(0, 0.52f, -0.07f)),      // trapezio
+            };
+            Vec3 topV(0, 0.55f, 0), botV(0, 0.0f, 0);
+            mat(sk[0], sk[1], sk[2], 0.08f, 8);
+            loft(T, 5, &topV, &botV, Vec3(0, 0.28f, 0));
+            // gomos do abdomen (sombra plana)
+            mat(sk[0] * 0.82f, sk[1] * 0.78f, sk[2] * 0.78f, 0.02f, 4);
+            decal(Vec3(-0.006f, 0.29f, 0.131f * b), Vec3(0.006f, 0.29f, 0.131f * b), Vec3(0.006f, 0.1f, 0.12f * b), Vec3(-0.006f, 0.1f, 0.12f * b), 0.004f);
+            if (dmg > 0.5f) {   // vergao vermelho nas costelas
+                mat(0.7f, 0.25f, 0.28f, 0.05f, 6);
+                decal(Vec3(-0.17f * b, 0.25f, 0.06f), Vec3(-0.1f * b, 0.27f, 0.11f * b), Vec3(-0.1f * b, 0.2f, 0.11f * b), Vec3(-0.16f * b, 0.19f, 0.06f), 0.006f);
+            }
         }
         glPopMatrix();
         // ---- Pescoco e cabeca ----
-        mat(sk[0], sk[1], sk[2], 0.12f, 14);
-        limb(hips + spineUp * 0.5f, head - spineUp * 0.1f, 0.085f * bulk, 0.07f);
+        mat(sk[0], sk[1], sk[2], 0.08f, 8);
+        prism(hips + spineUp * 0.52f, head - spineUp * 0.08f, 0.07f * bulk, 0.06f, 6, bodyF);
 
         Vec3 hUp = normalize(spineUp - f.snap * 2.5f);
         Vec3 hF = normalize(cross(hUp, bodyR));
         Vec3 hR = normalize(cross(hF, hUp));
         glPushMatrix();
         multFrame(head, hR, hUp, hF);
-        mat(sk[0], sk[1], sk[2], 0.3f, 18);
-        glPushMatrix(); glScalef(0.125f, 0.15f, 0.135f); sphere(1, 20, 16); glPopMatrix();
-        glPushMatrix(); glTranslatef(0, -0.075f, 0.015f); glScalef(0.09f, 0.06f, 0.09f); sphere(1, 14, 10); glPopMatrix();   // mandibula
-        for (int s = -1; s <= 1; s += 2) { glPushMatrix(); glTranslatef(s * 0.125f, 0, -0.01f); glScalef(0.025f, 0.04f, 0.03f); sphere(1, 8, 6); glPopMatrix(); }
-        glPushMatrix(); glTranslatef(0, -0.005f, 0.135f); glScalef(0.022f, 0.032f, 0.026f); sphere(1, 10, 8); glPopMatrix(); // nariz
-        // olhos (o esquerdo incha com muito dano)
-        for (int s = -1; s <= 1; s += 2) {
-            bool swollen = (s == -1 && dmg > 0.6f);
-            glPushMatrix(); glTranslatef(s * 0.045f, 0.025f, 0.112f);
-            if (swollen) {
-                mat(0.55f, 0.25f, 0.4f, 0.4f, 20);
-                glPushMatrix(); glScalef(0.03f, 0.022f, 0.02f); sphere(1, 10, 8); glPopMatrix();
-            } else {
-                mat(0.95f, 0.95f, 0.95f, 0.6f, 50);
-                glPushMatrix(); glScalef(0.022f, 0.016f, 0.012f); sphere(1, 10, 8); glPopMatrix();
-                mat(0.05f, 0.04f, 0.03f, 0.8f, 60);
-                glPushMatrix(); glTranslatef(0, 0, 0.011f); sphere(0.009f, 8, 6); glPopMatrix();
-            }
-            glPopMatrix();
-            // sobrancelhas franzidas
-            mat(L.hair[0] * 0.6f, L.hair[1] * 0.6f, L.hair[2] * 0.6f, 0.05f, 4);
-            glPushMatrix(); glTranslatef(s * 0.047f, 0.058f, 0.122f); glRotatef(s * -14.0f, 0, 0, 1); box(0.045f, 0.011f, 0.012f); glPopMatrix();
-        }
-        mat(0.45f, 0.1f, 0.1f, 0.3f, 20);    // boca (protetor bucal)
-        glPushMatrix(); glTranslatef(0, -0.06f, 0.118f); glScalef(0.04f, 0.011f, 0.012f); sphere(1, 10, 6); glPopMatrix();
-        // cabelo / bone
-        mat(L.hair[0], L.hair[1], L.hair[2], 0.25f, 20);
-        switch (L.hairStyle) {
-        case 1:
-            glPushMatrix(); glTranslatef(0, 0.03f, -0.01f); glScalef(0.132f, 0.135f, 0.138f);
-            { GLdouble eq[4] = { 0, 1, 0, -0.1 }; glClipPlane(GL_CLIP_PLANE0, eq); glEnable(GL_CLIP_PLANE0); sphere(1, 18, 12); glDisable(GL_CLIP_PLANE0); }
-            glPopMatrix(); break;
-        case 2:
-            for (int i = 0; i < 6; ++i) {
-                float a = (-40 + i * 22) * DEG2RAD;
-                glPushMatrix(); glTranslatef(0, std::cos(a) * 0.15f, std::sin(a) * 0.14f - 0.01f);
-                glRotatef(-a * RAD2DEG, 1, 0, 0); box(0.035f, 0.07f, 0.035f); glPopMatrix();
-            }
-            break;
-        case 3:
-            glPushMatrix(); glTranslatef(0, 0.03f, -0.01f); glScalef(0.133f, 0.137f, 0.14f);
-            { GLdouble eq[4] = { 0, 1, 0, -0.05 }; glClipPlane(GL_CLIP_PLANE0, eq); glEnable(GL_CLIP_PLANE0); sphere(1, 18, 12); glDisable(GL_CLIP_PLANE0); }
-            glPopMatrix();
-            for (int i = 0; i < 4; ++i) { glPushMatrix(); glTranslatef(0, 0.06f - i * 0.05f, -0.15f - i * 0.025f); sphere(0.035f - i * 0.004f, 10, 8); glPopMatrix(); }
-            break;
-        case 4:
-            glPushMatrix(); glTranslatef(0, 0.04f, 0);
-            { GLdouble eq[4] = { 0, 1, 0, 0.0 }; glClipPlane(GL_CLIP_PLANE0, eq); glEnable(GL_CLIP_PLANE0); glScalef(0.135f, 0.12f, 0.14f); sphere(1, 18, 12); glDisable(GL_CLIP_PLANE0); }
-            glPopMatrix();
-            glPushMatrix(); glTranslatef(0, 0.045f, 0.15f); box(0.17f, 0.015f, 0.1f); glPopMatrix();
-            break;
-        default: break;
-        }
-        if (L.beard) {
-            mat(L.hair[0], L.hair[1], L.hair[2], 0.1f, 6);
-            glPushMatrix(); glTranslatef(0, -0.085f, 0.05f); glScalef(0.1f, 0.06f, 0.085f); sphere(1, 14, 10); glPopMatrix();
-        }
+        drawHead(L, sk, dmg, flash);
         glPopMatrix();
     }
 
@@ -332,11 +572,13 @@ static void drawFighter(const Fighter& f, const Appearance& L, DrawMode mode, in
         Vec3 pole = S + R * (side * 0.35f) + U * -0.5f + F * -0.15f;
         Vec3 E = solveElbow(S, G, 0.31f * std::sqrt(bulk), 0.30f, pole);
         Vec3 wrist = G - normalize(G - E) * 0.13f;
-        mat(sk[0], sk[1], sk[2], 0.12f, 14);
-        if (mode == DRAW_FULL) { glPushMatrix(); translate(S); sphere(0.078f * bulk, 12, 10); glPopMatrix(); }
-        limb(S, E, 0.062f * bulk, 0.05f * bulk);
-        glPushMatrix(); translate(E); sphere(0.05f * bulk, 10, 8); glPopMatrix();
-        limb(E, wrist, 0.05f * bulk, 0.042f);
+        mat(sk[0], sk[1], sk[2], 0.08f, 8);
+        if (mode == DRAW_FULL) {   // deltoide
+            glPushMatrix(); translate(S); blob(0.074f * bulk, 0.07f * bulk, 0.074f * bulk, 7, 4, 50 + h, 0.03f); glPopMatrix();
+        }
+        prism(S, E, 0.064f * bulk, 0.05f * bulk, 5, F);
+        blobAt(E, 0.05f * bulk, 5, 3, 52 + h);
+        prism(E, wrist, 0.052f * bulk, 0.042f, 5, F);
 
         if (f.useMitts && L.mitts) {
             mittPad(G, -F, h == litMitt);
@@ -354,6 +596,7 @@ static void drawFighter(const Fighter& f, const Appearance& L, DrawMode mode, in
         if (f.furyTimer > 0) { er += 0.45f; eg += 0.05f; }
         glove(G, G - E, spineUp, side, L.gloves, er, eg, eb);
     }
+    if (cull) glEnable(GL_CULL_FACE);
 }
 
 // ---------------------------------------------------------------------------
@@ -712,10 +955,60 @@ static Vec3 setupLights(const Game& g, int sceneKind) {
 }
 
 // ---------------------------------------------------------------------------
+// MODO PS1: a cena e desenhada numa viewport pequena (240 linhas), copiada
+// para uma textura e ampliada para a janela com filtro GL_NEAREST.
+// ---------------------------------------------------------------------------
+static void presentLowRes(int vw, int vh, int winW, int winH) {
+    static GLuint id = 0;
+    static int tw = 0, th = 0;
+    int nw = 1, nh = 1;                      // OpenGL 1.1: textura potencia de 2
+    while (nw < vw) nw <<= 1;
+    while (nh < vh) nh <<= 1;
+    if (!id) glGenTextures(1, &id);
+    glBindTexture(GL_TEXTURE_2D, id);
+    if (nw != tw || nh != th) {
+        tw = nw; th = nh;
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, tw, th, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+    }
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, vw, vh);
+
+    glViewport(0, 0, winW, winH);
+    glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, 1, 0, 1, -1, 1);
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+    glDisable(GL_DEPTH_TEST); glDisable(GL_LIGHTING); glDisable(GL_FOG); glDisable(GL_BLEND);
+    glEnable(GL_TEXTURE_2D);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    float u = vw / (float)tw, v = vh / (float)th;
+    glBegin(GL_QUADS);
+    glTexCoord2f(0, 0); glVertex2f(0, 0);
+    glTexCoord2f(u, 0); glVertex2f(1, 0);
+    glTexCoord2f(u, v); glVertex2f(1, 1);
+    glTexCoord2f(0, v); glVertex2f(0, 1);
+    glEnd();
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    glDisable(GL_TEXTURE_2D);
+    glEnable(GL_DEPTH_TEST);
+}
+
+// ---------------------------------------------------------------------------
 // RENDER PRINCIPAL
 // ---------------------------------------------------------------------------
 void render(const Game& g) {
     gTime = g.gameTime;
+    gPs1 = g.ps1;
+    static bool lastPs1 = false;
+    if (gPs1 != lastPs1) { Textures::setNearest(gPs1); lastPs1 = gPs1; }
+    int vw = g.winW, vh = g.winH;
+    if (gPs1) {
+        vh = std::min(g.winH, 240);
+        vw = std::max(1, (int)std::lround(vh * g.winW / (double)g.winH));
+    }
+    gScaleX = g.winW / (float)vw;
+    gScaleY = g.winH / (float)vh;
     bool run = (g.state == GS_TRAIN && g.train == TR_RUN);
     bool gym = (g.state == GS_HUB || g.state == GS_TRAIN || g.state == GS_TRAIN_RESULT) && !run;
     int kind = run ? 2 : (gym ? 1 : 0);
@@ -728,7 +1021,7 @@ void render(const Game& g) {
     glClearStencil(0);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
-    glViewport(0, 0, g.winW, g.winH);
+    glViewport(0, 0, vw, vh);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     gluPerspective(g.cam.fov, g.winW / (double)std::max(1, g.winH), firstPerson ? 0.03 : 0.1, 150.0);
@@ -743,7 +1036,7 @@ void render(const Game& g) {
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
     glEnable(GL_NORMALIZE);
-    glShadeModel(g.smooth ? GL_SMOOTH : GL_FLAT);
+    glShadeModel(g.smooth && !gPs1 ? GL_SMOOTH : GL_FLAT);
     glPolygonMode(GL_FRONT_AND_BACK, g.wire ? GL_LINE : GL_FILL);
     glCullFace(GL_BACK);
     glDisable(GL_CULL_FACE);
@@ -827,6 +1120,7 @@ void render(const Game& g) {
     glDisable(GL_FOG);
     glDisable(GL_LIGHTING);
     glDisable(GL_CULL_FACE);
+    if (gPs1) presentLowRes(vw, vh, g.winW, g.winH);
 }
 
 } // namespace Scene

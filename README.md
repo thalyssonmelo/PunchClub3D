@@ -73,6 +73,7 @@ cmake --build build --config Release
 | **F6** | iluminação liga/desliga |
 | **F7** | modo aramado (wireframe) |
 | **F8** | cones de luz liga/desliga |
+| **F9** | modo PS1 liga/desliga (cena 3D em 240 linhas ampliada com `GL_NEAREST`, sombreamento flat, sem especular) |
 
 ---
 
@@ -123,7 +124,7 @@ O ganho de cada treino diminui conforme o atributo sobe. O jogo é salvo automat
 | **Texturas** | 10 texturas **procedurais** (lona com logotipo, saia do ringue com texto, torcida, madeira, couro, saco, asfalto, grama, faixa, concreto). Ruído fractal, fonte bitmap própria, **mipmaps** e `GL_MODULATE` | `Textures.cpp` |
 | **Visibilidade** | Z-buffer, back-face culling, **descarte por frustum** da arquibancada (o F1 mostra quantas seções foram desenhadas), neblina e planos de recorte (`glClipPlane`) no cabelo | `Scene.cpp` |
 | **Sombras** | Sombras planares projetadas (matriz de sombra) com **stencil buffer**: só sobre a lona, sem mistura dupla | `Scene.cpp` (`shadowMatrix`, `beginShadow`) |
-| **Modelagem hierárquica / animação** | Lutadores montados por articulações, braços e pernas com **cinemática inversa de 2 ossos**, reação da cabeça com mola amortecida e trajetórias dos golpes por **curvas de Bézier** | `Scene.cpp`, `Fighter.cpp` |
+| **Modelagem hierárquica / animação** | Lutadores **low-poly facetados** modelados à mão (malhas de anéis para cabeça, tronco e calção, prismas nos membros, luvas facetadas, normal por face) e montados por articulações. Marcas de machucado aparecem conforme a vida cai (hematoma, corte, olho inchado, nariz sangrando). Braços e pernas com **cinemática inversa de 2 ossos**, reação da cabeça com mola amortecida e trajetórias dos golpes por **curvas de Bézier** | `Scene.cpp`, `Fighter.cpp` |
 | **Bibliotecas complementares** | **miniaudio** (áudio). Os 15 efeitos são **sintetizados em tempo de execução** (osciladores, ruído filtrado, envelopes), então não há arquivos de som | `Audio.cpp`, `third_party/miniaudio.h` |
 | Transparência | Cones de luz aditivos, partículas de suor, HUD com alfa e vinhetas | `Scene.cpp`, `Hud.cpp` |
 
@@ -138,7 +139,7 @@ src/
   Collision.h     testes de colisão (esfera x esfera, esfera varrida)
   AI.*            IA do adversário
   Scene.*         renderização 3D
-  Hud.*           interface 2D (textos com acentos, barras, telas)
+  Hud.*           interface 2D em pixel art (fonte bitmap 5x7 própria com acentos, barras, telas)
   Textures.*      texturas procedurais
   Audio.*         síntese e reprodução de som
 tests/combat_test.cpp   teste automático das colisões

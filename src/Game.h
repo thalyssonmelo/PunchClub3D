@@ -110,6 +110,7 @@ public:
     // Opcoes graficas (teclas F1..F8)
     bool showDebug = false, shadows = true, fog = true, smooth = true, hints = true;
     bool wire = false, lighting = true, cones = true;
+    bool ps1 = false;         // F9: cena em baixa resolucao (estilo PS1)
     int crowdDrawn = 0, crowdTotal = 0;
 
     // Entrada

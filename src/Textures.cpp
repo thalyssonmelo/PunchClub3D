@@ -337,4 +337,13 @@ void bind(TexId id) {
 }
 void unbind() { glDisable(GL_TEXTURE_2D); }
 
+// Modo PS1: texels "estourados" (sem filtragem e sem mistura entre mipmaps)
+void setNearest(bool on) {
+    for (int i = 0; i < NUM_TEX; ++i) {
+        glBindTexture(GL_TEXTURE_2D, ids[i]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, on ? GL_NEAREST : GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, on ? GL_NEAREST_MIPMAP_NEAREST : GL_LINEAR_MIPMAP_LINEAR);
+    }
+}
+
 } // namespace Textures
